@@ -1,9 +1,10 @@
 package main
 
 import (
-	"actopus"
 	"errors"
 	"fmt"
+	"github.com/jarium/actopus"
+
 	"os"
 	"time"
 )
