@@ -1,134 +1,129 @@
 package actopus
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
+	"os"
 	"strconv"
-	"sync"
 	"time"
 )
 
 var (
-	ErrBehaviorExist = errors.New("actor with this name already exists")
+	OptionWithLogger = func(logger io.Writer) func(e *Engine) {
+		return func(e *Engine) {
+			e.logger = logger
+		}
+	}
+	OptionWithRoot = func(rc RootConfig) func(e *Engine) {
+		return func(e *Engine) {
+			e.root = newSupervisor("root", 0, rc.ToSupervisorConfig(), e.logger)
+		}
+	}
+	OptionSupervisors = func(supervisorConfigs ...SupervisorConfig) func(e *Engine) {
+		return func(e *Engine) {
+			var supervisors []*supervisor
+			for i, c := range supervisorConfigs {
+				supervisors = append(supervisors, newSupervisor(strconv.Itoa(i), len(supervisors), c, e.logger))
+			}
+
+			for _, s := range supervisors {
+				for _, c := range s.children {
+					if c.getName() == specActor {
+						actor := c.(*Actor)
+						e.registry[actor.config.Name] = actor
+					}
+				}
+			}
+
+			e.supervisors = supervisors
+		}
+	}
 )
 
-type EngineConfig struct {
-	Logger           io.Writer
-	ActorInboxSize   int
-	SupervisorConfig SupervisorConfig
+type Option func(e *Engine)
+
+var defaultRootConfig = RootConfig{
+	MaxRestarts:      0,
+	RestartDelay:     0,
+	ShutdownInterval: 0,
+	RestartStrategy:  OneForOneStrategy,
+	RestartValue:     RestartValueTemporary,
 }
 
-// Engine wraps root supervisor process
+type RootConfig struct {
+	MaxRestarts      int
+	RestartDelay     time.Duration
+	ShutdownInterval time.Duration
+	RestartStrategy  restartStrategy
+	RestartValue     int
+}
+
+func (r RootConfig) ToSupervisorConfig() SupervisorConfig {
+	return SupervisorConfig{
+		MaxRestarts:      r.MaxRestarts,
+		RestartDelay:     r.RestartDelay,
+		ShutdownInterval: r.ShutdownInterval,
+		RestartStrategy:  r.RestartStrategy,
+		RestartValue:     r.RestartValue,
+	}
+}
+
 type Engine struct {
-	config   EngineConfig
-	logger   io.Writer
-	root     *Supervisor
-	registry map[string]*Actor
-	mu       sync.RWMutex
+	logger      io.Writer
+	root        *supervisor
+	supervisors []*supervisor
+	registry    map[string]*Actor
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
-func NewEngine(config EngineConfig) *Engine {
-	return &Engine{
-		config:   config,
-		logger:   config.Logger,
-		registry: make(map[string]*Actor),
-		root:     NewSupervisor(1, config.Logger, config.SupervisorConfig, nil),
-	}
-}
-
-// Spawn an actor under available Supervisor.
-func (e *Engine) Spawn(b behavior, name string) (*Actor, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if _, ok := e.registry[name]; ok {
-		return nil, ErrBehaviorExist
+func NewEngine(opts ...Option) *Engine {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Engine{
+		root:        newSupervisor("root", 0, defaultRootConfig.ToSupervisorConfig(), os.Stdout),
+		supervisors: []*supervisor{},
+		registry:    map[string]*Actor{},
+		logger:      os.Stdout,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
-	actor := NewActor(len(e.registry)+1, name, b, e.config.ActorInboxSize)
-	last := e.getLastSupervisor()
-	last.Run(actor)
+	for _, o := range opts {
+		o(e)
+	}
 
-	e.registry[name] = actor
-	return actor, nil
+	e.root.logger = e.logger
+	for _, s := range e.supervisors {
+		s.logger = e.logger
+		e.root.children = append(e.root.children, s)
+	}
+
+	return e
 }
 
-// Tree returns json representation of current supervision tree, useful for monitoring
+func (e *Engine) Start() context.Context {
+	go func() {
+		if err := e.root.run(e.ctx); err != nil {
+			e.logger.Write([]byte(fmt.Sprintf("root error: %s\n", err.Error())))
+		}
+	}()
+
+	return e.ctx
+}
+
+func (e *Engine) Stop() {
+	e.cancel()
+}
+
+// GetActor returns defined Actor or nil if it not exists
+func (e *Engine) GetActor(name string) *Actor {
+	return e.registry[name]
+}
+
+// Tree returns json representation of current supervision tree
 func (e *Engine) Tree() string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	type ActorData struct {
-		CreatedAt    string `json:"createdAt"`
-		State        string `json:"state"`
-		Restarts     int    `json:"restarts"`
-		MessageCount int    `json:"messageCount"`
-		Behavior     string `json:"behavior"`
-		//@todo: add last error
-	}
-	type SupervisorData struct {
-		ID        string               `json:"id"`
-		CreatedAt string               `json:"createdAt"`
-		Actors    map[string]ActorData `json:"actors"`
-		Child     *SupervisorData      `json:"child"`
-	}
-
-	stateMap := map[int]string{
-		stateInitialized: "Initialized",
-		stateRunning:     "Running",
-		stateStopped:     "Stopped",
-		stateHealing:     "Healing",
-		stateFatal:       "Fatal",
-	}
-
-	var data *SupervisorData
-
-	for current := e.root; current != nil; current = current.child {
-		currentData := &SupervisorData{
-			ID:        "supervisor_" + strconv.Itoa(current.ID),
-			Actors:    make(map[string]ActorData),
-			CreatedAt: current.createdAt.Format(time.DateTime),
-		}
-
-		for _, actor := range current.actors {
-			actorKey := "actor_" + strconv.Itoa(actor.pid)
-			currentData.Actors[actorKey] = ActorData{
-				CreatedAt:    actor.createdAt.Format(time.DateTime),
-				State:        stateMap[actor.GetState()],
-				Restarts:     actor.GetRestarts(),
-				MessageCount: len(actor.inbox),
-				Behavior:     actor.behaviorName,
-			}
-		}
-
-		if data == nil {
-			data = currentData
-			continue
-		}
-
-		var lastChildData *SupervisorData
-		for childData := data.Child; childData != nil; childData = childData.Child {
-			lastChildData = childData
-		}
-
-		if lastChildData == nil {
-			data.Child = currentData
-			continue
-		}
-
-		lastChildData.Child = currentData
-	}
-
-	m, _ := json.Marshal(data)
+	m, _ := json.Marshal(e.root.getInfo())
 	return string(m)
-}
-
-func (e *Engine) getLastSupervisor() *Supervisor {
-	current := e.root
-	for child := current.child; child != nil; child = child.child {
-		current = child
-	}
-
-	return current
 }

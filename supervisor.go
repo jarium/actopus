@@ -1,88 +1,187 @@
 package actopus
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 )
 
 type SupervisorConfig struct {
-	MaxRestarts  int
-	RestartDelay time.Duration
-	MaxActors    int
+	MaxRestarts       int
+	RestartDelay      time.Duration
+	ShutdownInterval  time.Duration
+	RestartStrategy   restartStrategy
+	RestartValue      int
+	ActorConfigs      []ActorConfig
+	SupervisorConfigs []SupervisorConfig
 }
 
-type Supervisor struct {
-	ID        int
-	config    SupervisorConfig
-	actors    map[int]*Actor
-	createdAt time.Time
-
-	logger io.Writer
-
-	parent *Supervisor
-	child  *Supervisor
+type SupervisorInfo struct {
+	ID                 string                    `json:"id"`
+	CreatedAt          string                    `json:"createdAt"`
+	UpdatedAt          string                    `json:"updatedAt"`
+	State              string                    `json:"state"`
+	Restarts           int                       `json:"restarts"`
+	RestartedSpecCount int                       `json:"restartedSpecCount"`
+	Actors             map[string]ActorInfo      `json:"actors,omitempty"`
+	Children           map[string]SupervisorInfo `json:"children"`
+	LastError          string                    `json:"lastError"`
 }
 
-func NewSupervisor(id int, logger io.Writer, config SupervisorConfig, parent *Supervisor) *Supervisor {
-	return &Supervisor{
-		ID:        id,
-		createdAt: time.Now(),
-		config:    config,
-		actors:    make(map[int]*Actor),
-		logger:    logger,
-		child:     nil,
-		parent:    parent,
+type supervisor struct {
+	config             SupervisorConfig
+	children           []spec
+	restartedSpecCount int
+	logger             io.Writer
+	*baseSpec
+}
+
+func newSupervisor(id string, index int, config SupervisorConfig, logger io.Writer) *supervisor {
+	s := &supervisor{
+		config:   config,
+		logger:   logger,
+		children: []spec{},
+		baseSpec: newBaseSpec(id, index, config.RestartValue, config.ShutdownInterval),
+	}
+
+	for _, ac := range config.ActorConfigs {
+		actorId := id + "_" + strconv.Itoa(len(s.children))
+		s.children = append(s.children, newActor(actorId, len(s.children), ac))
+	}
+
+	for _, sc := range config.SupervisorConfigs {
+		supervisorId := id + "_" + strconv.Itoa(len(s.children))
+		s.children = append(s.children, newSupervisor(supervisorId, len(s.children), sc, logger))
+	}
+
+	return s
+}
+
+func (s *supervisor) run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	restartEvents := make(chan restartEvent, len(s.children))
+	restarts := 0
+
+	s.startChildren(ctx, restartEvents)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case e := <-restartEvents:
+			s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, restart event for %s, id: %s, err: %s\n", s.id, e.wrapper.sp.getName(), e.wrapper.sp.getId(), e.err.Error())))
+			if s.config.MaxRestarts != 0 && restarts >= s.config.MaxRestarts {
+				return errors.New("max restarts have been exceeded")
+			}
+			s.restart(ctx, e)
+			restarts++
+		}
 	}
 }
 
-func (s *Supervisor) Run(a *Actor) {
-	if len(s.actors) < s.config.MaxActors {
-		// if enough room, assign to this supervisor.
-		s.actors[a.pid] = a
-		a.belongsTo = s
-		s.supervise(a)
-		a.start()
-		a.setState(stateRunning)
-		s.logger.Write([]byte(fmt.Sprintf("actor started under supervisor id: %d, pid: %d\n", s.ID, a.pid)))
+func (s *supervisor) getName() string {
+	return specSupervisor
+}
+
+func (s *supervisor) restart(ctx context.Context, e restartEvent) {
+	e.wrapper.sp.setState(stateRestarting)
+	time.Sleep(s.config.RestartDelay)
+	s.config.RestartStrategy(ctx, s, e)
+	s.incrementRestartedSpecCount()
+	e.wrapper.sp.incrementRestart()
+	s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, successful restart event by %s, id: %s\n", s.id, e.wrapper.sp.getName(), e.wrapper.sp.getId())))
+}
+
+func (s *supervisor) startSpec(wrapper *specWrapper) {
+	err := wrapper.sp.run(wrapper.ctx)
+	wrapper.sp.setState(stateStopped)
+	if err != nil {
+		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, spec %s got error, id: %s, err: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId(), err.Error())))
+		wrapper.sp.setLastError(err)
+		if wrapper.sp.getRestartValue() == RestartValueTemporary {
+			return
+		}
+		wrapper.restartChan <- restartEvent{
+			wrapper: wrapper,
+			err:     err,
+		}
 		return
 	}
 
-	// if not enough room, create a new supervisor under this.
-	child := NewSupervisor(s.ID+1, s.logger, s.config, s)
-	s.child = child
-
-	// assign to child
-	child.Run(a)
+	if wrapper.sp.getRestartValue() == RestartValuePermanent {
+		wrapper.restartChan <- restartEvent{
+			wrapper: wrapper,
+			err:     errors.New("restart value is permanent"),
+		}
+	}
 }
 
-func (s *Supervisor) supervise(a *Actor) {
-	go func() {
-		select {
-		case <-a.ctx.Done():
-			a.setState(stateStopped)
-			s.logger.Write([]byte(fmt.Sprintf("actor stopped, pid: %d\n", a.pid)))
-			return
-		case err := <-a.errChan:
-			if a.GetRestarts() < s.config.MaxRestarts {
-				// @todo: one to one. support other strategies in the future
-				a.setState(stateHealing)
-				s.logger.Write([]byte(fmt.Sprintf("actor got error, restarting. err: %s, pid: %d\n", err.Error(), a.pid)))
-				time.Sleep(s.config.RestartDelay)
+func (s *supervisor) startChildren(ctx context.Context, restartChan chan restartEvent) {
+	var wrappers []*specWrapper
 
-				defer func() {
-					a.incrementRestart()
-					s.supervise(a)
-					a.start()
-					a.setState(stateRunning)
-				}()
-				return
-			}
+	for _, sp := range s.children {
+		wrapper := newSpecWrapper(ctx, sp, restartChan)
+		wrappers = append(wrappers, wrapper)
+	}
 
-			// @todo: remove actor? restart supervisor?
-			a.setState(stateFatal)
-			s.logger.Write([]byte(fmt.Sprintf("actor max restarts limit reached. err: %s, pid: %d\n", err.Error(), a.pid)))
-			return
+	for _, w := range wrappers {
+		w.siblings = wrappers
+		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, running %s, id: %s\n", s.id, w.sp.getName(), w.sp.getId())))
+		w.sp.setState(stateRunning)
+		go func(w *specWrapper) {
+			defer close(w.done)
+			s.startSpec(w)
+		}(w)
+	}
+}
+
+func (s *supervisor) incrementRestartedSpecCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t := time.Now()
+	s.updatedAt = &t
+	s.restartedSpecCount++
+}
+
+func (s *supervisor) getInfo() SupervisorInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	actorInfos := map[string]ActorInfo{}
+	supervisorInfos := map[string]SupervisorInfo{}
+	for _, c := range s.children {
+		if c.getName() == specActor {
+			actorInfos["actor_"+c.getId()] = c.(*Actor).GetInfo()
+			continue
 		}
-	}()
+
+		supervisorInfos["supervisor_"+c.getId()] = c.(*supervisor).getInfo()
+	}
+
+	var lastError string
+	if s.lastError != nil {
+		lastError = s.lastError.Error()
+	}
+
+	var updatedAt string
+	if s.updatedAt != nil {
+		updatedAt = s.updatedAt.Format(time.DateTime)
+	}
+
+	return SupervisorInfo{
+		ID:                 "supervisor_" + s.getId(),
+		CreatedAt:          s.createdAt.Format(time.DateTime),
+		UpdatedAt:          updatedAt,
+		State:              stateMap[s.state],
+		Actors:             actorInfos,
+		Children:           supervisorInfos,
+		Restarts:           s.restarts,
+		RestartedSpecCount: s.restartedSpecCount,
+		LastError:          lastError,
+	}
 }

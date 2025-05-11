@@ -4,50 +4,74 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jarium/actopus"
-
-	"os"
 	"time"
 )
 
-// Example
 func main() {
-	conf := actopus.EngineConfig{
-		Logger:         os.Stdout,
-		ActorInboxSize: 1000,
-		SupervisorConfig: actopus.SupervisorConfig{
-			MaxRestarts:  1,
-			RestartDelay: time.Second * 5,
-			MaxActors:    4,
+	printer := actopus.ActorConfig{
+		Name:             "printer",
+		RestartValue:     actopus.RestartValuePermanent,
+		InboxLimit:       100,
+		ShutdownInterval: time.Second / 2,
+		Behavior: func(msg actopus.Message) error {
+			fmt.Println(msg.Data)
+			return nil
 		},
 	}
 
-	eng := actopus.NewEngine(conf)
-
-	//helloer
-	helloer := func(msg string) error {
-		fmt.Printf("hello message: %s\n", msg)
-		return nil
+	errorer := actopus.ActorConfig{
+		Name:             "errorer",
+		RestartValue:     actopus.RestartValuePermanent,
+		InboxLimit:       100,
+		ShutdownInterval: time.Second / 2,
+		Behavior: func(msg actopus.Message) error {
+			return errors.New("there was an error")
+		},
 	}
-	actor1, _ := eng.Spawn(helloer, "helloer")
-	actor1.Tell("message_1")
-	actor1.Tell("message_2")
 
-	//errorer
-	errorer := func(msg string) error {
-		return errors.New("i return error")
+	panicker := actopus.ActorConfig{
+		Name:             "panicker",
+		RestartValue:     actopus.RestartValuePermanent,
+		InboxLimit:       100,
+		ShutdownInterval: time.Second / 2,
+		Behavior: func(msg actopus.Message) error {
+			panic("whoops")
+		},
 	}
-	actor2, _ := eng.Spawn(errorer, "errorer")
-	actor2.Tell("message_1")
-	actor2.Tell("message_2")
 
-	//panicker
-	panicker := func(msg string) error {
-		panic("i panic")
+	supervisor := actopus.SupervisorConfig{
+		MaxRestarts:      1,
+		RestartDelay:     time.Second / 2,
+		ShutdownInterval: time.Second / 2,
+		RestartStrategy:  actopus.OneForOneStrategy,
+		RestartValue:     actopus.RestartValuePermanent,
+		ActorConfigs: []actopus.ActorConfig{
+			printer,
+			errorer,
+			panicker,
+		},
+		SupervisorConfigs: nil,
 	}
-	actor3, _ := eng.Spawn(panicker, "panicker")
-	actor3.Tell("message_1")
-	actor3.Tell("message_2")
 
-	time.Sleep(time.Second * 10)
-	fmt.Println(eng.Tree())
+	engine := actopus.NewEngine(actopus.OptionSupervisors(supervisor))
+	ctx := engine.Start()
+	go func() {
+		time.Sleep(time.Second * 30)
+		engine.Stop()
+	}()
+
+	actors := []*actopus.Actor{
+		engine.GetActor("printer"),
+		engine.GetActor("errorer"),
+		engine.GetActor("panicker"),
+	}
+
+	for _, a := range actors {
+		a.Tell(actopus.Message{
+			Data: "hi actors!",
+		})
+	}
+
+	<-ctx.Done()
+	fmt.Println(engine.Tree())
 }
