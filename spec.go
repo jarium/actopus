@@ -65,7 +65,6 @@ func (sw *specWrapper) stop() {
 	time.Sleep(sw.shutdownInterval)
 	sw.cancel()
 	<-sw.done
-	sw.sp.setState(stateStopped)
 }
 
 type spec interface {
