@@ -97,8 +97,13 @@ func (s *supervisor) restart(ctx context.Context, e restartEvent) {
 }
 
 func (s *supervisor) startSpec(wrapper *specWrapper) {
-	err := wrapper.sp.run(wrapper.ctx)
+	s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, spec %s starting, id: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId())))
+	wrapper.sp.setState(stateRunning)
+
+	err := wrapper.sp.run(wrapper.ctx) //will block until stop
+
 	wrapper.sp.setState(stateStopped)
+	s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, spec %s stopped, id: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId())))
 	if err != nil {
 		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, spec %s got error, id: %s, err: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId(), err.Error())))
 		wrapper.sp.setLastError(err)
@@ -130,8 +135,6 @@ func (s *supervisor) startChildren(ctx context.Context, restartChan chan restart
 
 	for _, w := range wrappers {
 		w.siblings = wrappers
-		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, running %s, id: %s\n", s.id, w.sp.getName(), w.sp.getId())))
-		w.sp.setState(stateRunning)
 		go func(w *specWrapper) {
 			defer close(w.done)
 			s.startSpec(w)

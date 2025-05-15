@@ -2,7 +2,6 @@ package actopus
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"sort"
 )
@@ -12,13 +11,11 @@ type restartStrategy func(ctx context.Context, s *supervisor, e restartEvent)
 var (
 	OneForOneStrategy = func(ctx context.Context, s *supervisor, e restartEvent) {
 		e.wrapper.stop()
-		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, stopped %s, id: %s\n", s.id, e.wrapper.sp.getName(), e.wrapper.sp.getId())))
 
 		newWrapper := newSpecWrapper(ctx, e.wrapper.sp, e.wrapper.restartChan)
 		e.wrapper.siblings[e.wrapper.sp.getIndex()] = newWrapper
 
 		newWrapper.siblings = e.wrapper.siblings
-		s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, running %s, id: %s\n", s.id, e.wrapper.sp.getName(), e.wrapper.sp.getId())))
 		go func(w *specWrapper) {
 			defer close(w.done)
 			s.startSpec(w)
@@ -28,7 +25,6 @@ var (
 		for i := len(e.wrapper.siblings) - 1; i >= 0; i-- {
 			wrapper := e.wrapper.siblings[i]
 			wrapper.stop()
-			s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, stopped %s, id: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId())))
 		}
 
 		for len(e.wrapper.restartChan) > 0 {
@@ -55,7 +51,6 @@ var (
 		for i := len(childrenToRestart) - 1; i >= 0; i-- {
 			wrapper := childrenToRestart[i]
 			wrapper.stop()
-			s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, stopped %s, id: %s\n", s.id, wrapper.sp.getName(), wrapper.sp.getId())))
 			stoppedIds[wrapper.sp.getId()] = true
 		}
 
@@ -81,8 +76,6 @@ var (
 
 		for _, w := range wrappers {
 			w.siblings = e.wrapper.siblings
-			s.logger.Write([]byte(fmt.Sprintf("supervisor: %s, running %s, id: %s\n", s.id, w.sp.getName(), w.sp.getId())))
-			w.sp.setState(stateRunning)
 			go func(w *specWrapper) {
 				defer close(w.done)
 				s.startSpec(w)

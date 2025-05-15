@@ -18,26 +18,18 @@ var (
 	}
 	OptionWithRoot = func(rc RootConfig) func(e *Engine) {
 		return func(e *Engine) {
-			e.root = newSupervisor("root", 0, rc.ToSupervisorConfig(), e.logger)
+			e.rootConstructor = func(logger io.Writer) *supervisor {
+				return newSupervisor("root", 0, rc.ToSupervisorConfig(), logger)
+			}
 		}
 	}
 	OptionSupervisors = func(supervisorConfigs ...SupervisorConfig) func(e *Engine) {
 		return func(e *Engine) {
-			var supervisors []*supervisor
 			for i, c := range supervisorConfigs {
-				supervisors = append(supervisors, newSupervisor(strconv.Itoa(i), len(supervisors), c, e.logger))
+				e.supervisorConstructors = append(e.supervisorConstructors, func(logger io.Writer) *supervisor {
+					return newSupervisor(strconv.Itoa(i), i, c, e.logger)
+				})
 			}
-
-			for _, s := range supervisors {
-				for _, c := range s.children {
-					if c.getName() == specActor {
-						actor := c.(*Actor)
-						e.registry[actor.config.Name] = actor
-					}
-				}
-			}
-
-			e.supervisors = supervisors
 		}
 	}
 )
@@ -71,33 +63,51 @@ func (r RootConfig) ToSupervisorConfig() SupervisorConfig {
 }
 
 type Engine struct {
-	logger      io.Writer
-	root        *supervisor
-	supervisors []*supervisor
-	registry    map[string]*Actor
-	ctx         context.Context
-	cancel      context.CancelFunc
+	logger                 io.Writer
+	root                   *supervisor
+	rootConstructor        func(logger io.Writer) *supervisor
+	supervisorConstructors []func(logger io.Writer) *supervisor
+	registry               map[string]*Actor
+	ctx                    context.Context
+	cancel                 context.CancelFunc
 }
 
 func NewEngine(opts ...Option) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		root:        newSupervisor("root", 0, defaultRootConfig.ToSupervisorConfig(), os.Stdout),
-		supervisors: []*supervisor{},
-		registry:    map[string]*Actor{},
-		logger:      os.Stdout,
-		ctx:         ctx,
-		cancel:      cancel,
+		supervisorConstructors: []func(logger io.Writer) *supervisor{},
+		registry:               map[string]*Actor{},
+		ctx:                    ctx,
+		cancel:                 cancel,
 	}
 
 	for _, o := range opts {
 		o(e)
 	}
 
-	e.root.logger = e.logger
-	for _, s := range e.supervisors {
-		s.logger = e.logger
-		e.root.children = append(e.root.children, s)
+	if e.logger == nil {
+		e.logger = os.Stdout
+	}
+	if e.rootConstructor == nil {
+		e.rootConstructor = func(logger io.Writer) *supervisor {
+			return newSupervisor("root", 0, defaultRootConfig.ToSupervisorConfig(), e.logger)
+		}
+	}
+	e.root = e.rootConstructor(e.logger)
+
+	var supervisors []spec
+	for _, sc := range e.supervisorConstructors {
+		supervisors = append(supervisors, sc(e.logger))
+	}
+	e.root.children = append(e.root.children, supervisors...)
+
+	for _, s := range supervisors {
+		for _, c := range s.(*supervisor).children {
+			if c.getName() == specActor {
+				actor := c.(*Actor)
+				e.registry[actor.config.Name] = actor
+			}
+		}
 	}
 
 	return e
