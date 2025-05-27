@@ -13,6 +13,14 @@ func main() {
 		RestartValue:     actopus.RestartValuePermanent,
 		InboxLimit:       100,
 		ShutdownInterval: time.Second / 2,
+		OnStart: func() error {
+			fmt.Println("printer OnStart!")
+			return nil
+		},
+		OnStop: func() error {
+			fmt.Println("printer OnStop!")
+			return nil
+		},
 		Behavior: func(msg actopus.Message) error {
 			fmt.Println(msg.Data)
 			return nil
@@ -24,6 +32,10 @@ func main() {
 		RestartValue:     actopus.RestartValuePermanent,
 		InboxLimit:       100,
 		ShutdownInterval: time.Second / 2,
+		OnError: func() error {
+			fmt.Println("errorer OnError!")
+			return nil
+		},
 		Behavior: func(msg actopus.Message) error {
 			return errors.New("there was an error")
 		},
@@ -34,6 +46,10 @@ func main() {
 		RestartValue:     actopus.RestartValuePermanent,
 		InboxLimit:       100,
 		ShutdownInterval: time.Second / 2,
+		OnPanic: func() error {
+			fmt.Println("panicker OnPanic!")
+			return nil
+		},
 		Behavior: func(msg actopus.Message) error {
 			panic("whoops")
 		},

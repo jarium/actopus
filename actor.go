@@ -7,11 +7,17 @@ import (
 	"time"
 )
 
+var discardOnAction = func() error { return nil }
+
 type ActorConfig struct {
 	Name             string //must be unique or will be overridden by the next name
 	RestartValue     int
 	InboxLimit       int
 	ShutdownInterval time.Duration
+	OnStart          func() error
+	OnStop           func() error
+	OnError          func() error
+	OnPanic          func() error
 	Behavior         func(msg Message) error
 }
 
@@ -44,6 +50,19 @@ type Actor struct {
 }
 
 func newActor(id string, index int, c ActorConfig) *Actor {
+	if c.OnStart == nil {
+		c.OnStart = discardOnAction
+	}
+	if c.OnStop == nil {
+		c.OnStop = discardOnAction
+	}
+	if c.OnError == nil {
+		c.OnError = discardOnAction
+	}
+	if c.OnPanic == nil {
+		c.OnPanic = discardOnAction
+	}
+
 	a := &Actor{
 		config:   c,
 		inbox:    make(chan Message, c.InboxLimit),
@@ -54,6 +73,9 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 		defer func() {
 			if r := recover(); r != nil {
 				runErr = fmt.Errorf("panic: %v", r)
+				if onPanicErr := c.OnPanic(); onPanicErr != nil {
+					runErr = fmt.Errorf("runErr: %w, onPanicErr: %w", runErr, onPanicErr)
+				}
 				return
 			}
 		}()
@@ -64,7 +86,13 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 				return errPoisoned
 			}
 
-			return a.config.Behavior(msg)
+			if err := a.config.Behavior(msg); err != nil {
+				runErr = err
+				if onErrorErr := a.config.OnError(); onErrorErr != nil {
+					runErr = fmt.Errorf("runErr: %w, onErrorErr: %w", runErr, onErrorErr)
+				}
+			}
+			return
 		default:
 			return
 		}
@@ -73,17 +101,30 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 	return a
 }
 
-func (a *Actor) run(ctx context.Context) error {
+func (a *Actor) run(ctx context.Context) (err error) {
+	if onStartErr := a.config.OnStart(); onStartErr != nil {
+		return fmt.Errorf("onStartErr: %w", onStartErr)
+	}
+
+	defer func() {
+		if err == nil {
+			if onStopErr := a.config.OnStop(); onStopErr != nil {
+				err = fmt.Errorf("onStopErr: %w", onStopErr)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
-			if err := a.do(); err != nil {
-				if errors.Is(err, errPoisoned) {
+			if doErr := a.do(); doErr != nil {
+				if errors.Is(doErr, errPoisoned) {
 					return nil
 				}
-				return err
+				err = doErr
+				return
 			}
 		}
 	}
