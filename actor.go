@@ -7,17 +7,18 @@ import (
 	"time"
 )
 
-var discardOnAction = func() error { return nil }
+var discardOnAction = func(*Actor) error { return nil }
 
 type ActorConfig struct {
 	Name             string //must be unique or will be overridden by the next name
 	RestartValue     int
 	InboxLimit       int
+	MessagePopCount  int
 	ShutdownInterval time.Duration
-	OnStart          func() error
-	OnStop           func() error
-	OnError          func() error
-	OnPanic          func() error
+	OnStart          func(a *Actor) error
+	OnStop           func(a *Actor) error
+	OnError          func(a *Actor) error
+	OnPanic          func(a *Actor) error
 	Behavior         func(msg Message) error
 }
 
@@ -45,7 +46,7 @@ type ActorInfo struct {
 type Actor struct {
 	config ActorConfig
 	do     func() error
-	inbox  chan Message
+	inbox  MessageQueue
 	*baseSpec
 }
 
@@ -65,7 +66,7 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 
 	a := &Actor{
 		config:   c,
-		inbox:    make(chan Message, c.InboxLimit),
+		inbox:    NewRingBufferMessageQueue(c.InboxLimit),
 		baseSpec: newBaseSpec(id, index, c.RestartValue, c.ShutdownInterval),
 	}
 
@@ -73,42 +74,46 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 		defer func() {
 			if r := recover(); r != nil {
 				runErr = fmt.Errorf("panic: %v", r)
-				if onPanicErr := c.OnPanic(); onPanicErr != nil {
+				if onPanicErr := c.OnPanic(a); onPanicErr != nil {
 					runErr = fmt.Errorf("runErr: %w, onPanicErr: %w", runErr, onPanicErr)
 				}
 				return
 			}
 		}()
 
-		select {
-		case msg := <-a.inbox:
-			if msg == poisonPill {
+		msgs, ok := a.inbox.Pop(c.MessagePopCount)
+		if !ok {
+			time.Sleep(time.Second)
+			return
+		}
+
+		for _, m := range msgs {
+			if m == poisonPill {
 				return errPoisoned
 			}
 
-			if err := a.config.Behavior(msg); err != nil {
+			if err := a.config.Behavior(m); err != nil {
 				runErr = err
-				if onErrorErr := a.config.OnError(); onErrorErr != nil {
+				if onErrorErr := a.config.OnError(a); onErrorErr != nil {
 					runErr = fmt.Errorf("runErr: %w, onErrorErr: %w", runErr, onErrorErr)
 				}
+				return
 			}
-			return
-		default:
-			return
 		}
+		return
 	}
 
 	return a
 }
 
 func (a *Actor) run(ctx context.Context) (err error) {
-	if onStartErr := a.config.OnStart(); onStartErr != nil {
+	if onStartErr := a.config.OnStart(a); onStartErr != nil {
 		return fmt.Errorf("onStartErr: %w", onStartErr)
 	}
 
 	defer func() {
 		if err == nil {
-			if onStopErr := a.config.OnStop(); onStopErr != nil {
+			if onStopErr := a.config.OnStop(a); onStopErr != nil {
 				err = fmt.Errorf("onStopErr: %w", onStopErr)
 			}
 		}
@@ -135,7 +140,7 @@ func (a *Actor) getName() string {
 }
 
 func (a *Actor) Tell(msg Message) {
-	a.inbox <- msg
+	a.inbox.Add(msg)
 }
 
 // GetInfo about this Actor
@@ -158,7 +163,7 @@ func (a *Actor) GetInfo() ActorInfo {
 		UpdatedAt:    updatedAt,
 		State:        stateMap[a.state],
 		Restarts:     a.restarts,
-		MessageCount: len(a.inbox),
+		MessageCount: a.inbox.Len(),
 		MaxMessages:  a.config.InboxLimit,
 		Behavior:     a.config.Name,
 		LastError:    lastError,
