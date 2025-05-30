@@ -44,9 +44,10 @@ type ActorInfo struct {
 }
 
 type Actor struct {
-	config ActorConfig
-	do     func() error
-	inbox  MessageQueue
+	config             ActorConfig
+	do                 func() error
+	inbox              MessageQueue
+	messagesInProgress []Message
 	*baseSpec
 }
 
@@ -65,9 +66,10 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 	}
 
 	a := &Actor{
-		config:   c,
-		inbox:    NewRingBufferMessageQueue(c.InboxLimit),
-		baseSpec: newBaseSpec(id, index, c.RestartValue, c.ShutdownInterval),
+		config:             c,
+		inbox:              NewRingBufferMessageQueue(c.InboxLimit),
+		messagesInProgress: make([]Message, 0, c.MessagePopCount),
+		baseSpec:           newBaseSpec(id, index, c.RestartValue, c.ShutdownInterval),
 	}
 
 	a.do = func() (runErr error) {
@@ -81,13 +83,18 @@ func newActor(id string, index int, c ActorConfig) *Actor {
 			}
 		}()
 
-		msgs, ok := a.inbox.Pop(c.MessagePopCount)
-		if !ok {
-			time.Sleep(time.Second)
-			return
+		if len(a.messagesInProgress) == 0 {
+			msgs, ok := a.inbox.Pop(c.MessagePopCount)
+			if !ok {
+				time.Sleep(time.Second)
+				return
+			}
+			a.messagesInProgress = msgs
 		}
 
-		for _, m := range msgs {
+		for _, m := range a.messagesInProgress {
+			a.messagesInProgress = a.messagesInProgress[1:]
+
 			if m == poisonPill {
 				return errPoisoned
 			}
